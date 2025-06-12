@@ -2,7 +2,7 @@
 
 [Raport](https://bartoszoleszek.github.io/bank_churn_project/projekt_walidacja_churn.html)
 
-Projekt został zrealizowany w ramach przedmiotu **Metody walidacji modeli statystycznych**, przy wykorzystaniu języka R. Celem było zbudowanie i ocena modeli predykcyjnych umożliwiających przewidywanie odejścia klienta z banku (`churn`) na podstawie jego cech demograficznych, finansowych i behawioralnych.
+Projekt został zrealizowany w ramach przedmiotu **Metody walidacji modeli statystycznych**, przy wykorzystaniu języka R. Celem było zbudowanie i ocena modeli klasyfikacyjnych umożliwiających przewidywanie odejścia klienta z banku (`churn`) na podstawie jego cech demograficznych, finansowych i behawioralnych.
 
 ## Opis projektu
 
