@@ -1,5 +1,7 @@
 # Predykcja odejścia klienta z banku (churn)
 
+[Raport](./projekt_walidacja_churn.html)
+
 Projekt został zrealizowany w ramach przedmiotu **Metody walidacji modeli statystycznych**, przy wykorzystaniu języka R. Celem było zbudowanie i ocena modeli predykcyjnych umożliwiających przewidywanie odejścia klienta z banku (`churn`) na podstawie jego cech demograficznych, finansowych i behawioralnych.
 
 ## Opis projektu
