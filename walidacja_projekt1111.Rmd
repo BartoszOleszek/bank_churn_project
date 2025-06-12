@@ -1,0 +1,1178 @@
+---
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+<p style="text-align: center; font-size: 28px;"><strong>Projekt zaliczeniowy z przedmiotu</strong></p>
+<p style="text-align: center; font-size: 28px;"><strong>Metody walidacji modeli statystycznych</strong></p>
+<p style="text-align: center;"><strong>Bartosz Oleszek</strong></p>
+<p style="text-align: center;">2025-06-09</p>
+
+```{r, echo=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(dplyr)
+library(FSelectorRcpp)
+library(scales)
+library(knitr)
+library(tidymodels)
+library(Boruta)
+library(doParallel)
+library(foreach)
+library(rio)
+library(ggcorrplot)
+library(Hmisc)
+library(car)
+library(nortest)
+library(themis)
+library(discrim)
+library(klaR)
+library(ggplot2)
+library(doParallel)
+library(finetune)
+```
+
+## **Wybór zbioru danych**
+
+W projekcie wykorzystano zbiór danych **Bank Customer Churn Prediction**, dostępny publicznie na platformie Kaggle:
+https://www.kaggle.com/datasets/gauravtopre/bank-customer-churn-dataset
+
+Zbiór ten zawiera informacje o klientach banku, które mogą być pomocne w analizie zachowań konsumenckich, w szczególności w kontekście rezygnacji z usług bankowych. Dane są gotowe do użycia i nadają się do budowy i badania modeli uczenia maszynowego.
+
+Zbiór danych obejmuje:
+
+- 10 000 obserwacji,
+
+- 12 zmiennych, w tym dane demograficzne, finansowe oraz informację o tym, czy klient opuścił bank (zmienna `churn`).
+
+```{r, echo=FALSE}
+df <- import("Bank Customer Churn Prediction.csv")
+
+head(df) %>%
+  kbl() %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  scroll_box(width = "100%", height = "300px")
+```
+
+## **Zdefiniowanie problemu predykcyjnego oraz scharakteryzowanie analizowanego zbioru danych**
+
+Celem projektu jest zbudowanie i porównanie różnych modeli klasyfikacyjnych w celu znalezienia najlepszego rozwiązania do **przewidywania odejścia klienta z banku** na podstawie jego cech demograficznych i finansowych.
+
+Zmienna docelowa `churn` wskazuje, czy klient zrezygnował z usług bankowych:
+
+- `0` – klient pozostał w banku,
+
+- `1` – klient odszedł.
+
+Problem ten ma charakter **binarny (klasyfikacja 0/1)** i jest istotny z perspektywy biznesowej, ponieważ umożliwia budowanie systemów wczesnego ostrzegania o możliwej utracie klienta (Customer Retention Systems).
+
+
+### **Niezbalansowanie klas**
+
+Rozkład liczby obserwacji w poszczególnych klasach jest nierównomierny:
+
+```{r, echo=FALSE}
+df %>%
+  count(churn) %>%
+  mutate(
+    Opis = case_when(
+      churn == 0 ~ "klient pozostał",
+      churn == 1 ~ "klient odszedł"
+    ),
+    `Procent (%)` = round(100 * n / sum(n), 1)
+  ) %>%
+  dplyr::select(
+    Klasa = churn,
+    Opis,
+    `Liczba obserwacji` = n,
+    `Procent (%)`
+  ) %>%
+  kbl() %>%
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover"))
+```
+
+Taka struktura danych sugeruje potrzebę zastosowania odpowiednich technik balansowania danych treningowych (np. undersampling klasy dominującej lub oversampling klasy mniejszościowej) w celu poprawy skuteczności modeli predykcyjnych.
+
+### **Opis zmiennych w zbiorze danych**
+
+#### **1. Dane demograficzne**
+
+- `customer_id` – unikalny identyfikator klienta
+
+- `country` – kraj pochodzenia klienta (`France`, `Germany`, `Spain`)
+
+- `gender` – płeć klienta (`Male`, `Female`)
+
+- `age` – wiek klienta
+
+---
+
+#### **2. Dane dotyczące relacji z bankiem**
+
+- `tenure` – liczba lat współpracy z bankiem
+
+- `products_number` – liczba produktów bankowych posiadanych przez klienta
+
+- `credit_card` – informacja, czy klient posiada kartę kredytową (0 = nie, 1 = tak)
+
+- `active_member` – czy klient jest aktywnym użytkownikiem usług banku (0/1)
+
+---
+
+#### **3. Dane finansowe**
+
+- `credit_score` – ocena zdolności kredytowej klienta (skala punktowa - wyższa wartość oznacza większą wiarygodność kredytową)
+
+- `balance` – saldo na koncie klienta
+
+- `estimated_salary` – szacowane wynagrodzenie klienta
+
+---
+
+#### **4. Zmienna docelowa**
+
+- `churn` – informacja, czy klient zrezygnował z usług bankowych (0 = nie, 1 = tak)
+
+## **Czyszczenie danych oraz wstępna selekcja cech**
+
+### **Sprawdzenie braków danych występujących w zbiorze**
+
+```{r}
+any(colSums(is.na(df)) != "0")
+```
+
+Zwrócona wartość `FALSE` oznacza, że wszystkie kolumny są kompletne i nie wymagają imputacji braków.
+
+### **Usunięcie identyfikatora klienta**
+
+Zmienna `customer_id` jest unikalnym identyfikatorem klienta i nie wnosi wartości predykcyjnej do modelu.
+
+```{r}
+df <- df %>% dplyr::select(-customer_id)
+```
+
+### **Podział na zbiór treningowy, walidacyjny i testowy**
+
+Aby uniknąć przecieku danych i zapewnić obiektywną ocenę modeli, dane zostały podzielone na zbiór treningowy (70%), walidacyjny (15%) i testowy (15%). Podział został wykonany losowo, z zachowaniem proporcji klas zmiennej docelowej `churn`.
+
+```{r}
+set.seed(333)
+initial_split <- initial_split(df, prop = 0.85, strata = churn)
+dev_data <- training(initial_split)
+test_data <- testing(initial_split)  
+
+
+dev_split <- initial_split(dev_data, prop = 70/85, strata = churn)
+train_data <- training(dev_split)  
+valid_data <- testing(dev_split)
+```
+
+Dalsze przetwarzanie danych, selekcja cech, balansowanie oraz trenowanie modeli będzie wykonywane wyłącznie na zbiorze treningowym `train_data` oraz walidacyjnym` valid_data`. Zbiór testowy `test_data` zostanie wykorzystany wyłącznie do końcowej oceny skuteczności wybranych modeli.
+
+### **Konwersja na odpowiednie typy zmiennych**
+
+Zmienne kategoryczne przekształcono do typu factor, co jest wymagane w większości modeli klasyfikacyjnych.
+
+```{r}
+factor_vars <- c(
+  "country", "gender", "credit_card", "active_member", "churn", "products_number"
+)
+
+train_data[factor_vars] <- lapply(train_data[factor_vars], as.factor)
+valid_data[factor_vars] <- lapply(valid_data[factor_vars], as.factor)
+test_data[factor_vars] <- lapply(test_data[factor_vars], as.factor)
+```
+
+### **Usunięcie zmiennych o niskiej zmienności**
+
+W kolejnym kroku sprawdzono, czy w zbiorze treningowym występują zmienne o bardzo niskiej wariancji – zarówno numeryczne (wariancja bliska zeru), jak i kategoryczne (zdominowane przez jedną wartość). Takie zmienne nie wnoszą informacji do modelu i mogą wprowadzać szum.
+
+```{r}
+num_data <- train_data %>% dplyr::select(where(is.numeric))
+cat_data <- train_data %>% dplyr::select(where(is.factor))
+
+low_var_num <- sapply(num_data, var, na.rm = TRUE)
+low_var_num_cols <- names(low_var_num[low_var_num < 1e-5])
+
+low_var_cat_cols <- cat_data %>%
+  summarise(across(everything(), ~ max(table(.) / sum(!is.na(.))))) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "max_prop") %>%
+  filter(max_prop > 0.95) %>%
+  pull(variable)
+
+low_variance_cols <- c(low_var_num_cols, low_var_cat_cols)
+
+train_data <- train_data %>% dplyr::select(-all_of(low_variance_cols))
+valid_data <- valid_data %>% dplyr::select(-all_of(low_variance_cols))
+test_data  <- test_data %>% dplyr::select(-all_of(low_variance_cols))
+
+low_variance_cols
+```
+
+Nie wykryto żadnych zmiennych o zbyt niskiej wariancji, więc struktura danych nie została zmieniona.
+
+### **Analiza korelacji pomiędzy zmiennymi numerycznymi**
+
+W celu wykrycia potencjalnych redundancji lub współliniowości, przeanalizowano korelacje pomiędzy wszystkimi zmiennymi numerycznymi w zbiorze treningowym.
+
+```{r}
+correlation_data <- train_data %>% dplyr::select(where(is.numeric))
+
+cor_results <- rcorr(as.matrix(correlation_data))
+cor_matrix <- cor_results$r
+p_matrix <- cor_results$P
+
+ggcorrplot(
+  cor_matrix,
+  hc.order = TRUE,
+  type = "full",    
+  lab = TRUE,          
+  show.legend = TRUE,
+  tl.cex = 10,       
+  lab_size = 3,       
+  colors = c("blue", "white", "red")
+)
+```
+
+Na podstawie analizy można stwierdzić, że korelacje pomiędzy zmiennymi numerycznymi są bardzo niskie. Współczynniki korelacji Pearsona mieszczą się w przedziale od –0.01 do 0.03, co oznacza, że **brakuje istotnej współliniowości** między zmiennymi. Żadna z analizowanych cech nie wykazuje wyraźnej redundancji względem innych, dlatego wszystkie mogą zostać uwzględnione w dalszym modelowaniu bez obawy o współliniowość.
+
+### **Analiza istotności cech na podstawie Mutual Information**
+
+W celu oceny istotności predyktorów względem zmiennej docelowej `churn`, zastosowano miarę **Mutual Information**. Uwzględnia ona zarówno zależności liniowe, jak i nieliniowe, dzięki czemu lepiej odzwierciedla relacje między zmiennymi niż klasyczna korelacja. Poniżej przedstawiono uporządkowaną tabelę wyników oraz odpowiadający jej wykres łokciowy, który pozwala wizualnie ocenić, które cechy wnoszą najwięcej informacji.
+
+```{r}
+# zamiana factorów na character (wymóg FSelectorRcpp)
+df_mi <- train_data %>%
+  mutate_if(is.factor, as.character)
+
+# obliczenie mutual information względem zmiennej churn
+mi_scores <- information_gain(churn ~ ., data = df_mi)
+
+mi_sorted <- mi_scores %>% arrange(desc(importance))
+
+mi_table <- tibble(
+  Zmienna = mi_sorted$attributes,
+  `Mutual Information` = number(mi_sorted$importance, accuracy = 0.0001)
+)
+
+mi_table %>%
+  kbl() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r}
+mi_sorted <- mi_scores %>%
+  arrange(desc(importance))
+
+mi_sorted_plot <- mi_sorted %>%
+  mutate(index = row_number())
+
+ggplot(mi_sorted_plot, aes(x = index, y = importance)) +
+  geom_line(color = "steelblue") +
+  geom_point(color = "steelblue") +
+  labs(
+    title = "Wykres łokciowy – Mutual Information",
+    x = "Numer cechy",
+    y = "Wartość Mutual Information"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+Na podstawie uzyskanych wyników Mutual Information oraz wykresu łokciowego można zauważyć wyraźny spadek wartości informacyjnej po pierwszych dwóch cechach `products_number` i `age`. Ich wartości MI wynoszą odpowiednio 0.0711 i 0.0669, co oznacza, że mają one istotny wpływ na wartość zmiennej zależnej.
+
+Wartość Mutual Information dla kolejnych cech spada gwałtownie (poniżej 0.015), co wskazuje na ich znacznie mniejszy wkład w przewidywanie zmiennej `churn`. Z tego względu, jako najbardziej istotne predyktory do dalszego modelowania można rozważyć:
+
+- wybór tylko dwóch najistotniejszych zmiennych `age` i `products_number`, 
+
+- uwzględnienie dodatkowo cech `country` i `active_member`, które również przekraczają próg 0.01.
+
+
+Dla większej pewności zostanie teraz zastosowana **alternatywna selekcja cech z użyciem metody Boruta**, w celu porównania wyników i potwierdzenia znaczenia wybranych predyktorów.
+
+### **Analiza istotności cech z użyciem metody Boruta**
+
+W celu potwierdzenia wyników selekcji uzyskanych metodą Mutual Information zastosowano również algorytm **Boruta**, który opiera się na modelu lasu losowego i ocenia istotność predyktorów na podstawie porównania ich wpływu z wpływem sztucznie wygenerowanych „cech losowych”
+
+```{r}
+df_boruta <- train_data %>%
+  mutate_if(is.factor, as.character)
+
+df_boruta$churn <- as.factor(df_boruta$churn)
+
+boruta_path <- "boruta_results.rds"
+
+if (file.exists(boruta_path)) {
+  boruta_result <- readRDS(boruta_path)
+} else {
+  set.seed(123)
+  boruta_result <- Boruta(churn ~ ., data = df_boruta, doTrace = 1)
+  saveRDS(boruta_result, boruta_path)
+}
+confirmed_vars <- getSelectedAttributes(boruta_result, withTentative = FALSE)
+cat("Istotnymi zmiennymi wg metody Boruta są:", paste(confirmed_vars, collapse = ", "))
+``` 
+
+Analiza wykazała, że **7 zmiennych zostało uznanych za istotne**: `active_member`, `age`, `balance`, `country`, `credit_score`, `gender` oraz `products_number`.
+
+Metoda Boruta potwierdziła wysoką istotność czterech zmiennych wskazanych wcześniej przez Mutual Information: `products_number`, `age`, `active_member`, `country`, a także dodatkowo zasugerowała możliwą wartość predykcyjną kolejnych trzech zmiennych.
+
+```{r}
+importance_df <- attStats(boruta_result) %>%
+  rownames_to_column("Zmienna") %>%
+  filter(decision != "Rejected")
+
+ggplot(importance_df, aes(x = reorder(Zmienna, meanImp), y = meanImp, fill = decision)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Istotność cech względem zmiennej zależnej według metody Boruta",
+    x = "Zmienna",
+    y = "Średnia ważność"
+  ) +
+  scale_fill_manual(values = c("Confirmed" = "forestgreen", "Tentative" = "gold")) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+W kolejnej sekcji zostaną szczegółowo przeanalizowane wszystkie zmienne wskazane przez Borutę. Dla każdej z nich zostanie sprawdzona zależność pomiędzy wartością zmiennej a klasą `churn`, w celu określenia, czy większy sens ma trenowanie modeli na ograniczonym zestawie 4 predyktorów, czy też na pełnym zestawie 7 cech uznanych za istotne.
+
+## **Omówienie oraz zwizualizowanie istotnych zależności w analizowanym zbiorze danych**
+
+### **1. Porównanie wartości cech numerycznych w zależności od statusu churn**
+
+Na poniższym wykresie przedstawiono rozkład trzech wybranych zmiennych numerycznych w podziale na status klienta `churn`. Wstępna analiza boxplotów pozwala wysunąć następujące przypuszczenia:
+
+- wiek `age`: klienci, którzy odeszli z banku `churn` = 1, wydają się być średnio starsi niż ci, którzy pozostali `churn` = 0.
+
+- saldo konta `balance`: W grupie `churn` = 1 mediana salda jest wyższa niż w grupie `churn` = 0. Można przypuszczać istnienie różnic między grupami.
+
+- ocena kredytowa `credit_score`: Rozkłady wyglądają na zbliżone w obu grupach, bez wyraźnych różnic w medianie. Trudno oczekiwać istotnej zależności od statusu klienta.
+
+```{r, echo=FALSE}
+num_vars <- c("credit_score", "age", "balance")
+
+df_long <- train_data %>%
+  dplyr::select(all_of(num_vars), churn) %>%
+  pivot_longer(cols = all_of(num_vars), names_to = "Zmienna", values_to = "Wartosc")
+
+# Boxploty w 1 rzędzie (ncol = 4)
+ggplot(df_long, aes(x = churn, y = Wartosc, fill = churn)) +
+  geom_boxplot(outlier.size = 0.8, alpha = 0.9) +
+  facet_wrap(~ Zmienna, scales = "free", ncol = 3) +
+  labs(
+    title = "Porównanie cech numerycznych względem zmiennej churn",
+    x = "Odejście z banku",
+    y = "Wartość zmiennej",
+    fill = "Status klienta"
+  ) +
+  scale_fill_brewer(palette = "Set1", labels = c("0 – pozostał", "1 – odszedł")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    strip.text = element_text(face = "bold"),
+    legend.position = "right"
+  )
+```
+
+Na podstawie powyższej wizualizacji można przypuszczać, że zmienne `age` oraz `balance` mogą istotnie różnicować grupy klientów względem zmiennej zależnej `churn`. W celu weryfikacji tych obserwacji, w kolejnym kroku przeprowadzone zostaną testy statystyczne. Aby dobrać odpowiedni test (parametryczny lub nieparametryczny), konieczne jest uprzednie sprawdzenie założeń dotyczących normalności rozkładów.
+
+#### **Sprawdzenie normalności rozkładów**
+
+```{r, echo=FALSE}
+vars <- c("age", "balance", "credit_score")
+
+for (v in vars) {
+  for (ch in 0:1) {
+    test_result <- ad.test(train_data[[v]][train_data$churn == ch])
+    cat("Zmienne:", v, "| churn =", ch, "| p-value =", test_result$p.value, "\n")
+  }
+}
+```
+
+Dla każdej z analizowanych zmiennych numerycznych przeprowadzono test normalności Andersona–Darlinga osobno w grupach `churn` = 0 i `churn` = 1. We wszystkich przypadkach uzyskano wartości p<0.05, co oznacza, że rozkłady badanych zmiennych nie są zgodne z rozkładem normalnym.
+W związku z tym, do porównania zmiennych pomiędzy grupami zastosowano nieparametryczny test U Manna–Whitneya, który nie wymaga założenia o normalności.
+
+
+
+```{r}
+vars <- c("age", "balance", "credit_score")
+
+for (v in vars) {
+  test_result <- wilcox.test(train_data[[v]] ~ train_data$churn)
+  cat("Zmienne:", v, "| p-value =", round(test_result$p.value, 5), "\n")
+}
+```
+
+Test Manna-Whitneya wykazał, że zmienne `age` oraz `balance` różnicują istotnie grupy klientów względem zmiennej `churn` (p < 0.05), dlatego zostaną uwzględnione w dalszym modelowaniu.
+Dla zmiennej `credit_score` uzyskano p > 0.05, co oznacza brak istotnych różnic między grupami - w związku z tym cecha ta nie będzie brana pod uwagę w kolejnych etapach analizy.
+
+
+### **2. Analiza cech kategorycznych względem zmiennej churn**
+
+Na wykresach przedstawiono liczebności klientów, którzy odeszli `churn` = 1 i którzy pozostali `churn` = 0 w poszczególnych grupach zmiennych kategorycznych.
+
+Widać wyraźnie, że:
+
+- w grupie nieaktywnych klientów `active_member` = 0 odsetek rezygnacji jest zauważalnie wyższy niż wśród aktywnych,
+
+- w przypadku kraju pochodzenia `country`, wśród klientów z Niemiec proporcja `churn` jest znacznie wyższa niż np. we Francji,
+
+- dla płci `gender` różnice są mniej wyraźne, ale nadal zauważalne – więcej rezygnujących klientów to kobiety,
+
+- w przypadku liczby produktów `products_number`, najwięcej odejść występuje wśród klientów z 1 produktem – to może sugerować słabsze zaangażowanie w ofertę banku.
+
+```{r, echo=FALSE}
+cat_vars <- c("gender", "active_member", "country", "products_number")
+
+df_cat_long <- train_data %>%
+  dplyr::select(all_of(cat_vars), churn) %>%
+  pivot_longer(cols = all_of(cat_vars), names_to = "Zmienna", values_to = "Wartosc")
+
+ggplot(df_cat_long, aes(x = Wartosc, fill = churn)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ Zmienna, scales = "free", ncol = 2) +
+  labs(
+    title = "Rozkład statusu churn w grupach zmiennych kategorycznych",
+    x = "Wartość zmiennej",
+    y = "Liczba obserwacji",
+    fill = "Churn"
+  ) +
+  scale_fill_brewer(palette = "Set1", labels = c("0 – pozostał", "1 – odszedł")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+Na podstawie przedstawionych wizualizacji można przypuszczać, że analizowane zmienne kategoryczne są związane ze statusem klienta `churn` i mogą mieć istotną wartość predykcyjną.
+Aby potwierdzić te obserwacje, przeprowadzone zostaną testy niezależności chi-kwadrat Pearsona.
+
+```{r, echo=FALSE}
+cat_vars <- c("gender", "active_member", "country", "products_number")
+
+for (var in cat_vars) {
+  cat("\n==========", var, "==========\n")
+  test_result <- chisq.test(table(train_data[[var]], train_data$churn))
+  cat("Chi² test p-value:", test_result$p.value, "\n")
+}
+```
+
+Dla wszystkich analizowanych zmiennych kategorycznych uzyskano bardzo niską wartość p (p<0.05), co oznacza, że zmienne te mają istotny wpływ na odejście klienta z banku i mogą być wykorzystywane jako predyktory w dalszym modelowaniu.
+
+### **Ostateczny wniosek - wybór cech do modelowania**
+
+Na podstawie przeprowadzonych testów statystycznych wybrano finalny zestaw istotnych predyktorów do budowy modeli klasyfikacyjnych:
+
+- zmienne numeryczne: `age`, `balance`
+
+- zmienne kategoryczne: `gender`, `active_member`, `country`, `products_number`
+
+Zmienne te zostaną wykorzystane w kolejnym etapie procesu analitycznego – przygotowaniu danych do modelowania oraz trenowaniu i walidacji modeli predykcyjnych.
+
+```{r}
+selected_vars <- c("churn", "age", "balance", "gender", "active_member", "country", "products_number")
+
+train_data <- train_data %>% dplyr::select(all_of(selected_vars))
+valid_data <- valid_data %>% dplyr::select(all_of(selected_vars))
+test_data  <- test_data %>% dplyr::select(all_of(selected_vars))
+```
+
+## **Przygotowanie danych do dalszego procesu modelowania i ich eksploracja z użyciem technik uczenia maszynowego**
+
+### **Ustawienie klasy pozytywnej (klient odszedł) jako `1`**
+
+Dla łatwiejszej interpretacji ustawiono klasę pozytywną jako `1`, czyli klient odszedł z banku. Uporządkowanie poziomów klas w ten sposób ułatwia analizę metryk (np. recall i precision będą dotyczyć właśnie klasy odchodzących).
+
+```{r}
+train_data$churn <- factor(train_data$churn, levels = c("1", "0"))
+valid_data$churn <- factor(valid_data$churn, levels = c("1", "0"))
+test_data$churn  <- factor(test_data$churn,  levels = c("1", "0"))
+```
+
+### **Stworzenie recipe dla SMOTE**
+
+```{r}
+recipe_smote <- recipe(churn ~ ., data = train_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_smote(churn, seed = 333)  
+```
+
+### **Definicja listy modeli do przetestowania**
+
+Utworzono listę pięciu klasyfikatorów, które zostaną porównane. Każdy model zostaje skonfigurowany do trybu klasyfikacji `classification` i przypisany do odpowiedniego silnika `engine`.
+
+```{r}
+set.seed(333)
+model_list <- list(
+  logistic = logistic_reg() %>% set_engine("glm") %>% set_mode("classification"),
+  random_forest = rand_forest() %>% set_engine("ranger") %>% set_mode("classification"),
+  svm = svm_rbf() %>% set_engine("kernlab") %>% set_mode("classification"),
+  xgboost = boost_tree() %>% set_engine("xgboost") %>% set_mode("classification"),
+  naive_bayes = naive_Bayes() %>% set_engine("klaR") %>% set_mode("classification")
+)
+```
+
+### **Tworzenie workflowów - połączenie modeli z recipe**
+
+Utworzono funkcję pomocniczą, która łączy wybrany model z przepisem `recipe` w jedną strukturę workflow. Następnie tworzone są workflowy dla wszystkich modeli z listy, wykorzystując `recipe_smote`.
+
+```{r}
+create_workflow <- function(model_spec, recipe_obj) {
+  workflow() %>%
+    add_model(model_spec) %>%
+    add_recipe(recipe_obj)
+}
+```
+
+```{r}
+workflow_list <- purrr::map(model_list, create_workflow, recipe_obj = recipe_smote)
+names(workflow_list) <- names(model_list)
+```
+
+### **Funkcja do trenowania modeli i obliczania metryk**
+
+Funkcja ta dopasowuje workflow do danych treningowych, wykonuje predykcję na zbiorze treningowym i walidacyjnym, oblicza wybrane metryki (accuracy, precision, recall, F1) oraz generuje macierz pomyłek (confusion matrix).
+
+```{r}
+evaluate_workflow <- function(wf, train_data, valid_data) {
+  
+  set.seed(333)
+  chosen_metrics <- metric_set(accuracy, precision, recall, f_meas)
+  
+  # dopasowanie modelu
+  fitted_wf <- fit(wf, data = train_data)
+  
+  # predykcje na zbiorze treningowym
+  train_class <- predict(fitted_wf, new_data = train_data)
+  train_probs <- predict(fitted_wf, new_data = train_data, type = "prob")
+  train_preds <- bind_cols(train_data, train_class, train_probs)
+  # predykcje na zbiorze walidacyjnym
+  valid_class <- predict(fitted_wf, new_data = valid_data)
+  valid_probs <- predict(fitted_wf, new_data = valid_data, type = "prob")
+  valid_preds <- bind_cols(valid_data, valid_class, valid_probs)
+  
+  train_metrics <- chosen_metrics(train_preds, truth = churn, estimate = .pred_class)
+  valid_metrics <- chosen_metrics(valid_preds, truth = churn, estimate = .pred_class)
+  
+  # macierz pomyłek
+  valid_cm <- conf_mat(valid_preds, truth = churn, estimate = .pred_class)
+  
+  return(list(
+    model = fitted_wf,
+    train_metrics = train_metrics,
+    valid_metrics = valid_metrics,
+    valid_conf_mat = valid_cm
+  ))
+}
+```
+
+### **Trenowanie wszystkich modeli i zebranie wyników**
+
+Wywołano wyżej zdefiniowaną funkcję dla każdego modelu, używając tego samego zbioru treningowego i walidacyjnego. Zwrócone zostają metryki i macierze pomyłek dla każdego modelu.
+
+```{r}
+set.seed(333)
+evaluation_results <- purrr::map(workflow_list, evaluate_workflow,
+                                 train_data = train_data,
+                                 valid_data = valid_data)
+names(evaluation_results) <- names(workflow_list)
+```
+
+### **Przedstawienie metryk dla każdego z modelu**
+
+Utworzono funkcję `get_metrics_df()`, która pobiera metryki trenowania lub walidacji z listy wyników modeli. Następnie zostaną wygenerowane tabele metryk osobno dla zbioru treningowego i walidacyjnego.
+
+```{r}
+set.seed(333)
+get_metrics_df <- function(results_list, dataset = "train") {
+  purrr::map_dfr(results_list, 
+                 ~ .x[[paste0(dataset, "_metrics")]],
+                 .id = "model")
+}
+
+train_metrics_all <- get_metrics_df(evaluation_results, dataset = "train")
+valid_metrics_all <- get_metrics_df(evaluation_results, dataset = "valid")
+```
+
+### **Łączenie metryk i przygotowanie do wizualizacji**
+
+Dodajemy oznaczenie pochodzenia zbioru `train` lub `valid`, łączymy wyniki, usuwamy niepotrzebne kolumny i przekształcamy dane do formatu szerokiego (dzięki temu nie wyświetla nam sie ten sam model w kilku liniach), co ułatwia porównanie modeli.
+
+```{r}
+set.seed(333)
+train_metrics_all <- train_metrics_all %>% mutate(dataset = "train")
+valid_metrics_all <- valid_metrics_all %>% mutate(dataset = "valid")
+
+all_metrics <- bind_rows(train_metrics_all, valid_metrics_all) %>%
+  dplyr::select(-.estimator)
+
+metrics_wide <- all_metrics %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  arrange(model, dataset)
+```
+
+### **Tabela wyników dla omawianych modeli po balansowaniu SMOTE**
+
+```{r, echo=FALSE}
+set.seed(333)
+metrics_wide %>%
+  kable(format = "html", digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  row_spec(which(metrics_wide$dataset == "valid"), background = "#e0e0e0")
+```
+
+### **Wniosek:**
+
+Spośród wszystkich przetestowanych modeli najlepszy rezultat na zbiorze walidacyjnym osiągnął model **XGBoost**, uzyskując najwyższą wartość F1-score = 0.622. Oznacza to, że model ten najlepiej równoważy czułość (recall = 0.709) oraz precyzję (precision = 0.554) – czyli skutecznie wykrywa klientów, którzy odchodzą z banku, jednocześnie minimalizując liczbę fałszywych alarmów.
+
+Dodatkowo, wartości metryk uzyskanych na zbiorze treningowym (F1-score = 0.650, recall = 0.763, precision = 0.566) są zbliżone do wyników na zbiorze walidacyjnym. Taka spójność świadczy o tym, że model nie jest przeuczony, a jego ogólna zdolność do generalizacji na nowych danych jest bardzo dobra.
+
+Na podstawie powyższych analiz można uznać, że **XGBoost jest najbardziej zrównoważonym i skutecznym modelem do przewidywania odejścia klientów z banku w ramach tego projektu**.
+
+### **Macierz pomyłek dla modelu XGBoost po balansowaniu SMOTE**
+
+```{r, echo=FALSE}
+evaluation_results$xgboost$valid_conf_mat %>%
+  autoplot(type = "heatmap") +
+  scale_fill_gradient(low = "#deebf7", high = "#3182bd") +
+  theme_minimal()
+```
+
+Model wykrył 217 rzeczywistych odejść i błędnie przewidział odejście w 175 przypadkach. Jednocześnie przegapił 89 odejść i poprawnie przewidział, że 1020 klientów nie odejdzie. Takie rozłożenie błędów wskazuje, że model ma solidne podstawy i potencjał do dalszej poprawy. Przy zastosowaniu odpowiedniej metody balansowania danych oraz optymalizacji hiperparametrów, możliwe jest jeszcze skuteczniejsze wykrywanie klientów skłonnych do odejścia.
+
+**W kolejnym etapie porównane zostaną różne metody balansowania danych zastosowane na zbiorze treningowym. Celem jest wybór takiej techniki, która – w połączeniu z modelem XGBoost – zapewni najlepsze wyniki predykcyjne na zbiorze walidacyjnym.**
+
+
+## **Porównanie metod balansowania danych**
+
+W tej części zostanie porównane pięć technik balansowania danych przy stałym modelu XGBoost:
+
+- Brak balansowania (baseline),
+
+- SMOTE (Synthetic Minority Oversampling Technique),
+
+- ROSE (Random Over-Sampling Examples),
+
+- Oversampling (losowe powielanie klasy mniejszościowej),
+
+- Undersampling (losowe usuwanie z klasy większościowej).
+
+Dla każdej metody utworzono osobny `recipe`, który różni się jedynie zastosowaną techniką balansowania. Następnie na ich podstawie zbudowano workflowy z wykorzystaniem tego samego modelu bazowego (XGBoost). Do oceny skuteczności zastosowano wcześniej zdefiniowaną funkcję `evaluate_workflow()`.
+
+```{r}
+# Kod tworzenia recipe, workflowów oraz oceny został pominięty
+# ponieważ struktura i przebieg są analogiczne do poprzedniego etapu.
+```
+
+Następnie każdy model oceniono na zbiorze walidacyjnym przy użyciu tych samych metryk: F1-score, recall, precision oraz accuracy.
+
+```{r,echo=FALSE}
+recipe_none <- recipe(churn ~ ., data = train_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+```
+
+```{r,echo=FALSE}
+recipe_rose <- recipe(churn ~ ., data = train_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_rose(churn, seed = 333, minority_prop = 0.5, minority_smoothness = 1)
+```
+
+```{r, echo=FALSE}
+recipe_upsample <- recipe(churn ~ ., data = train_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_upsample(churn, seed = 333)
+```
+
+```{r, echo=FALSE}
+recipe_downsample <- recipe(churn ~ ., data = train_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_downsample(churn, seed = 333)
+```
+
+```{r, echo=FALSE}
+set.seed(333)
+recipes_list <- list(
+  none = recipe_none,
+  smote = recipe_smote,
+  rose = recipe_rose,
+  upsample = recipe_upsample,
+  downsample = recipe_downsample
+)
+
+xgboost_spec <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+```
+
+```{r, echo=FALSE}
+set.seed(333)
+workflow_list <- map(recipes_list, ~ workflow() %>%
+                       add_model(xgboost_spec) %>%
+                       add_recipe(.x))
+```
+
+```{r, echo=FALSE}
+set.seed(333)
+
+evaluation_results <- map(workflow_list, evaluate_workflow,
+                          train_data = train_data,
+                          valid_data = valid_data)
+
+names(evaluation_results) <- names(workflow_list)
+```
+
+```{r, echo=FALSE}
+set.seed(333)
+get_metrics_df <- function(results_list, dataset = "train") {
+  purrr::map_dfr(results_list, 
+                 ~ .x[[paste0(dataset, "_metrics")]],
+                 .id = "balancing")
+}
+```
+
+```{r, echo=FALSE}
+set.seed(333)
+train_metrics_all <- get_metrics_df(evaluation_results, "train") %>%
+  mutate(dataset = "train")
+
+valid_metrics_all <- get_metrics_df(evaluation_results, "valid") %>%
+  mutate(dataset = "valid")
+
+all_metrics <- bind_rows(train_metrics_all, valid_metrics_all) %>%
+  dplyr::select(-.estimator)
+
+
+metrics_wide <- all_metrics %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  arrange(balancing, dataset)
+```
+
+### **Tabela porównawcza – skuteczność metod balansowania**
+
+```{r,echo=FALSE}
+set.seed(333)
+metrics_wide %>%
+  kable(format = "html", digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  row_spec(which(metrics_wide$dataset == "valid"), background = "#e0e0e0")
+```
+
+
+W celu poprawy skuteczności wykrywania klientów odchodzących z banku, porównano pięć metod balansowania danych zastosowanych na zbiorze treningowym: brak balansowania, **SMOTE**, **ROSE**, **oversampling** (upsample) oraz **undersampling** (downsample).
+
+Wszystkie techniki zostały przetestowane w połączeniu z modelem **XGBoost** o domyślnych parametrach. Skuteczność oceniano na podstawie zbioru walidacyjnego, przy szczególnym uwzględnieniu metryk recall oraz F1-score, które są najważniejsze w kontekście detekcji klasy mniejszościowej (klientów odchodzących).
+
+W początkowej analizie najlepsze wyniki uzyskano dla modelu XGBoost z zastosowaniem metody SMOTE, który osiągnął **F1-score = 0.622**, **recall = 0.709** i **precision = 0.554**. Metryki były stabilne między zbiorem treningowym a walidacyjnym, co świadczy o dobrej generalizacji.
+
+W ramach porównania różnych technik balansowania (SMOTE, ROSE, oversampling, undersampling, brak balansowania), żadna z alternatywnych metod nie poprawiła wyników osiąganych przez SMOTE – tym samym potwierdzono zasadność jego wyboru jako optymalnej strategii dla modelu XGBoost.
+
+### **Finalny wybór**
+
+Zatem uznajemy, że model **XGBoost** najlepiej sobie radzi na zbiorze walidacyjnym, po balansowaniu metodą **SMOTE**.
+
+Dla tego połączenia zajmiemy się teraz tuningiem parametrów tego modelu.
+
+##	**Ewaluacja modeli uczenia maszynowego oraz ich kalibracja** 
+
+W tym kroku skoncentrowano się na optymalizacji parametrów modelu XGBoost, aby poprawić skuteczność predykcji zmiennej `churn`. Zamiast używać domyślnych wartości, zdecydowano się na losowe przeszukiwanie przestrzeni hiperparametrów - metodę, która:
+
+- pozwala szybciej znaleźć dobre rozwiązania w dużej przestrzeni możliwych ustawień,
+
+- została uznana w literaturze za bardziej efektywną od siatek pełnych (`grid search`) – szczególnie przy wielu parametrach.
+
+Tuning obejmuje 6 najważniejszych parametrów:
+
+- `trees` - liczba drzew (boosting iterations) - zakres od 300 do 1500
+
+- `tree_depth` - maksymalna głębokość drzew - zakres od 2 do 10
+
+- `learn_rate` - szybkość uczenia (mniejsza = wolniejsze, ale stabilniejsze uczenie) - zakres od 0.001 do 0.3
+
+- `loss_reduction` - minimalna strata wymagana do podziału - zakres od 0 do 10
+
+- `sample_size` - procent próbek używanych w każdej iteracji - zakres od 0.5 do 1.0
+
+- `mtry` - liczba cech losowanych przy podziale - od 2 do liczby cech
+
+### **Definicja modelu XGBoost z tunowanymi parametrami**
+
+```{r}
+xgboost_tune_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+```
+
+### **Połączenie modelu z przepisem**
+
+```{r}
+workflow_xgb <- workflow() %>%
+  add_model(xgboost_tune_spec) %>%
+  add_recipe(recipe_smote)
+```
+
+### **Określenie przestrzeni hiperparametrów**
+
+Zamiast domyślnych zakresów, zdefiniowano **rozsądne granice** dla każdego parametru, by przeszukiwanie było skuteczniejsze.
+
+```{r}
+set.seed(333)
+
+xgb_params <- parameters(
+  trees(range = c(300, 1500)),
+  tree_depth(range = c(2, 10)),
+  learn_rate(range = c(0.001, 0.3)),
+  loss_reduction(range = c(0, 10)),
+  sample_size = sample_prop(range = c(0.5, 1.0)),
+  finalize(mtry(), train_data)
+)
+```
+
+### **Generacja losowej siatki hiperparametrów**
+
+Z przestrzeni określonej powyżej losujemy 75 zestawów parametrów. Taka liczba pozwala dobrze „zeskanować” przestrzeń bez nadmiernego kosztu obliczeniowego.
+
+```{r}
+set.seed(333)
+xgb_grid <- grid_random(xgb_params, size = 75)
+```
+
+### **Przygotowanie walidacji krzyżowej**
+
+W celu wiarygodnej oceny modeli zastosowano 5-krotną walidację krzyżową z utrzymaniem proporcji klas (`strata = churn`).
+
+```{r}
+set.seed(333)
+folds <- vfold_cv(train_data, v = 5, strata = churn)
+```
+
+### **Trening i zapis wyników do pliku**
+
+Ze względu na czasochłonność procesu, tuning został wcześniej wykonany i zapisany jako obiekt `.rds`. Kod trenowania zostaje zakomentowany.
+
+```{r, eval=FALSE}
+cl <- makeCluster(5)
+registerDoParallel(cl)
+
+set.seed(333)
+tuned_xgb <- tune_grid(
+  workflow_xgb,
+  resamples = folds,
+  grid = xgb_grid,
+  metrics = metric_set(f_meas, recall, precision, accuracy),
+  control = control_grid(save_pred = TRUE)
+)
+
+stopCluster(cl)
+registerDoSEQ()
+saveRDS(tuned_xgb, file = "tuned_xgb_v2.rds")
+```
+
+#### **Wczytanie gotowego obiektu**
+
+```{r}
+tuned_xgb <- readRDS("tuned_xgb_v2.rds")
+```
+
+### **Wybór najlepszego zestawu hiperparametrów na podstawie ważonej funkcji metryk**
+
+**Ustalona funkcja oceny modelu**
+
+Po przeprowadzeniu tuningu i wygenerowaniu 75 losowych zestawów hiperparametrów, dla każdego z nich obliczono podstawowe metryki jakości modelu:
+`accuracy`, `precision`, `recall`, `F1-score`.
+
+Zamiast polegać na jednej wybranej metryce, zdecydowano się na ocenę modeli na podstawie **ważonej funkcji wszystkich czterech wskaźników**, zgodnie z priorytetami problemu:
+
+- największy nacisk położono na czułość (recall) – czyli zdolność wykrycia klientów odchodzących,
+
+- następnie na ogólną równowagę błędów, czyli F1-score,
+
+- w dalszej kolejności – na precyzję,
+
+- i w najmniejszym stopniu na trafność ogólną (accuracy).
+
+Wzór użyty do obliczenia ogólnego wyniku (`weighted_score`) dla każdego zestawu hiperparametrów był następujący:
+
+$$
+\text{Wynik} = 0.4 \cdot \text{recall} + 0.3 \cdot \text{F1-score} + 0.2 \cdot \text{precision} + 0.1 \cdot \text{accuracy}
+$$
+
+### **Obliczenie wartości weighted_score i wybór najlepszych modeli**
+
+Na podstawie wyników walidacji krzyżowej (CV), metryki zostały przekształcone do formatu „szerokiego” – tak, aby każda kombinacja hiperparametrów odpowiadała jednej linii. Następnie dodano kolumnę `weighted_score`, a najlepsze 10 konfiguracji posortowano malejąco.
+
+### **Top 10 zestawów wg weighted_score**
+
+```{r, echo=FALSE}
+metrics_summary <- collect_metrics(tuned_xgb, summarize = TRUE)
+
+metrics_wide <- metrics_summary %>%
+  dplyr::select(mtry, trees, tree_depth, learn_rate, loss_reduction, sample_size, .metric, mean) %>%
+  pivot_wider(names_from = .metric, values_from = mean)
+
+metrics_wide <- metrics_wide %>%
+  mutate(weighted_score = 0.4 * recall +
+                         0.3 * f_meas +
+                         0.2 * precision +
+                         0.1 * accuracy)
+
+metrics_wide %>%
+  arrange(desc(weighted_score)) %>%
+  slice(1:10) %>%
+  kable(digits = 4, format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+```
+
+Spośród 75 przetestowanych konfiguracji, najwyższy wynik uzyskał zestaw z:
+
+- `mtry` = 4
+
+- `trees` = 642
+
+- `tree_depth` = 9 
+
+- `learn_rate` = 1.0072
+
+- `loss_reduction` = 54.3278
+
+- `sample_size` = 0.5824
+
+Ten model osiągnął:
+
+- accuracy = 0.8131
+
+- F1-score = 0.6050
+
+- precision = 0.5328
+
+- recall = 0.7011
+
+- weighted_score = 0.6498
+
+### **Przypisanie najlepszego zestawu parametrów do workflowa**
+
+Na podstawie najwyższego `weighted_score`, utworzono nowy obiekt zawierający optymalne parametry:
+
+```{r}
+best_params <- tibble::tibble(
+  mtry = 4,
+  trees = 642,
+  tree_depth = 9,
+  learn_rate = 1.0072,
+  loss_reduction = 54.3278,
+  sample_size = 0.5824)
+```
+
+### **Zbudowanie workflowa i dopasowanie modelu na zbiorze treningowym i walidacyjnym**
+
+```{r}
+final_xgb_workflow <- finalize_workflow(workflow_xgb, best_params)
+```
+
+Po przypisaniu najlepszego zestawu hiperparametrów do workflowa, model został wytrenowany na zbiorze treningowym (`train_data`). Następnie dokonano predykcji zarówno na zbiorze treningowym, jak i walidacyjnym, aby porównać skuteczność predykcji i ocenić ryzyko przeuczenia.
+
+```{r}
+set.seed(333)
+
+fitted_model <- fit(final_xgb_workflow, data = train_data)
+
+preds_train <- predict(fitted_model, new_data = train_data) %>%
+  bind_cols(train_data)
+
+preds_valid <- predict(fitted_model, new_data = valid_data) %>%
+  bind_cols(valid_data)
+```
+
+### **Obliczenie metryk dla zbioru treningowe i walidacyjnego po tuningu oraz porównanie wyników z modelem domyślnym**
+
+Poniżej przedstawiono porównanie metryk dla modelu bazowego (XGBoost z domyślnymi parametrami + SMOTE) oraz modelu po tuningu, zarówno dla zbioru treningowego, jak i walidacyjnego:
+
+```{r,echo=FALSE}
+chosen_metrics <- metric_set(accuracy, precision, recall, f_meas)
+
+metrics_train <- chosen_metrics(preds_train, truth = churn, estimate = .pred_class) %>%
+  mutate(dataset = "train")
+
+metrics_valid <- chosen_metrics(preds_valid, truth = churn, estimate = .pred_class) %>%
+  mutate(dataset = "valid")
+
+metrics_tuned_train <- metrics_train %>%
+  mutate(model = "Tuning XGBoost")
+
+metrics_tuned_valid <- metrics_valid %>%
+  mutate(model = "Tuning XGBoost")
+
+metrics_default <- tribble(
+  ~model,         ~dataset, ~accuracy, ~precision, ~recall, ~f_meas,
+  "XGBoost default", "train",  0.833,     0.566,     0.763,   0.650,
+  "XGBoost default", "valid",  0.824,     0.554,     0.709,   0.622
+)
+
+metrics_tuned <- bind_rows(metrics_tuned_train, metrics_tuned_valid) %>%
+  dplyr::select(model, dataset, .metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  rename(accuracy = accuracy, precision = precision, recall = recall, f_meas = f_meas)
+
+comparison_tbl <- bind_rows(metrics_default, metrics_tuned)
+
+comparison_tbl %>%
+  kable(digits = 3, col.names = c("Model", "Zbiór", "Accuracy", "Precision", "Recall", "F1-score")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+
+```
+
+### **Wniosek - porównanie modeli**
+
+**1. Poprawa generalizacji**
+Choć wartości metryk po tuningu nie są znacząco wyższe niż w modelu domyślnym, to różnica metryk między train a valid jest mniejsza, co oznacza lepsze dopasowanie i mniejsze ryzyko przeuczenia.
+
+**2. Stabilność metryk**
+W modelu domyślnym różnica między train i valid dla F1-score wynosiła 0.028 (0.650 → 0.622), a w modelu po tuningu 0.027 (0.622 → 0.595). Różnice w recall spadły z 0.054 do 0.034.
+
+**3. Koszt – złożoność vs skuteczność**
+Tuning pozwolił dobrać bardziej zrównoważoną konfigurację, która prawdopodobnie jest mniej agresywna (mniejsze recall, ale większa stabilność), co może być korzystne w praktycznych zastosowaniach, gdzie liczy się przewidywalność i powtarzalność.
+
+Model po tuningu nieznacznie ustępuje bazowemu pod względem recall, ale cechuje się lepszą równowagą pomiędzy zbiorami i mniejszą różnicą metryk – dzięki czemu **można go uznać za bardziej stabilny i mniej podatny na przeuczenie**.
+
+### **Macierz pomyłek – zbiór walidacyjny (model po tuningu)**
+
+```{r, echo=FALSE}
+conf_mat_valid <- conf_mat(preds_valid, truth = churn, estimate = .pred_class)
+
+conf_mat_valid %>%
+  autoplot(type = "heatmap") +
+  scale_fill_gradient(low = "#deebf7", high = "#3182bd") +
+  theme_minimal()
+```
+
+- TP (True Positive) = 200
+Model poprawnie wykrył 200 klientów, którzy faktycznie odeszli.
+
+- TN (True Negative) = 1029
+Model poprawnie przewidział, że 1029 klientów nie odejdzie.
+
+- FP (False Positive) = 166
+→ Model błędnie uznał, że 166 klientów odejdzie, choć zostali.
+
+- FN (False Negative) = 106
+Model nie wykrył odejścia 106 klientów, którzy faktycznie zrezygnowali.
+
+Model skutecznie wykrywa odejścia, choć nadal generuje nieco fałszywych alarmów (FP = 166). Jednak liczba przeoczonych przypadków (FN) jest stosunkowo niska (106), co oznacza, że system oparty na tym modelu mógłby być realnie użyteczny w kampaniach utrzymania klienta (np. marketing retencyjny).
+
+
+## **Finalna ewaluacja – model po tuningu na zbiorze testowym**
+
+Po zakończeniu tuningu i przetrenowaniu modelu XGBoost na pełnym zbiorze `train + valid`, zastosowano go do predykcji na niezależnym zbiorze testowym.
+
+```{r}
+final_model_full <- fit(final_xgb_workflow, data = bind_rows(train_data, valid_data))
+
+# predykcja na zbiorze testowym
+preds_test <- predict(final_model_full, new_data = test_data) %>%
+  bind_cols(test_data)
+
+# predykcja na zbiorze treningowym (train + valid)
+preds_train_valid <- predict(final_model_full, new_data = bind_rows(train_data, valid_data)) %>%
+  bind_cols(bind_rows(train_data, valid_data))
+
+```
+
+### **Obliczenie metryk na nowym zbiorze treningowym (train+valid) i testowym**
+
+```{r, echo=FALSE}
+chosen_metrics <- metric_set(accuracy, precision, recall, f_meas)
+
+metrics_train_valid <- chosen_metrics(preds_train_valid, truth = churn, estimate = .pred_class) %>%
+  mutate(dataset = "train+valid", model = "Tuning XGBoost")
+
+metrics_test <- chosen_metrics(preds_test, truth = churn, estimate = .pred_class) %>%
+  mutate(dataset = "test", model = "Tuning XGBoost")
+
+metrics_summary <- bind_rows(metrics_train_valid, metrics_test) %>%
+  dplyr::select(model, dataset, .metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+metrics_summary %>%
+  kable(digits = 3, col.names = c("Model", "Zbiór", "Accuracy", "Precision", "Recall", "F1-score")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
+
+<br>
+
+- **Zgodność wyników na zbiorze testowym z wynikami treningowymi świadczy o bardzo dobrej generalizacji modelu.**
+
+- Różnice w metrykach pomiędzy `train+valid` a `test` są minimalne (0.002–0.003 punktu). Taki poziom rozbieżności wskazuje, że **model nie został przeuczony** – nie nauczył się tylko danych treningowych, ale potrafi skutecznie przewidywać również dla nowych przypadków.
+
+- **F1-score = 0.615** na zbiorze testowym pokazuje, że model **utrzymuje dobry balans między czułością (recall = 0.676) a precyzją (precision = 0.564)**, co jest szczególnie ważne w klasyfikacji nierównomiernie rozłożonych klas, takich jak `churn`.
+
+### **Macierz pomyłek – zbiór testowy**
+
+```{r, echo=FALSE}
+conf_mat_test <- conf_mat(preds_test, truth = churn, estimate = .pred_class)
+
+conf_mat_test %>%
+  autoplot(type = "heatmap") +
+  scale_fill_gradient(low = "#deebf7", high = "#3182bd") +
+  theme_minimal()
+```
+
+#### **Interpretacja:**
+
+- 210 przypadków to prawidłowo wykryci klienci, którzy faktycznie odeszli (True Positives),
+
+- 96 przypadków to klienci, którzy odeszli, ale model tego nie przewidział (False Negatives),
+
+- 169 przypadków to fałszywe alarmy – model przewidział odejście, ale klient został (False Positives),
+
+- 1026 przypadków to prawidłowe klasyfikacje klientów, którzy zostali (True Negatives).
+
+### **Wniosek**
+
+- Model skutecznie wykrywa odejścia (recall = 0.676), ale **ok. 1/4 odejść pozostaje niewykryta**.
+
+- Mimo to, liczba fałszywych alarmów jest umiarkowana, a ogólna dokładność modelu (accuracy = 0.827) pozostaje wysoka.
+
+- Model może być użyteczny jako narzędzie wspierające działanie systemów retencji klientów, choć wrażliwe zastosowania powinny uwzględnić kompromis między czułością a precyzją.
+
+## **Podsumowanie i wnioski**
+
+Projekt miał na celu zbudowanie i ocenę modeli predykcyjnych do wykrywania odejścia klienta z banku na podstawie danych demograficznych, finansowych i behawioralnych.
+
+Wykorzystano rzeczywisty zbiór danych **Bank Customer Churn** z platformy Kaggle. Po wstępnym oczyszczeniu danych, podzielono je na trzy niezależne zbiory (`train`, `valid`, `test`) z zachowaniem proporcji klas. Następnie przeprowadzono analizę istotności cech z wykorzystaniem **Mutual Information** oraz **metody Boruta**, wskazując finalny zestaw sześciu predyktorów:
+
+- zmienne numeryczne: `age`, `balance`
+
+- zmienne kategoryczne: `gender`, `active_member`, `country`, `products_number`
+
+Analiza statystyczna wykazała, że każda z tych zmiennych istotnie różnicuje grupy klientów względem zmiennej `churn`.
+
+W ramach dalszej analizy przetestowano pięć klasycznych modeli klasyfikacyjnych. Najlepsze wyniki – zarówno pod względem skuteczności, jak i równowagi między metrykami – uzyskał model **XGBoost**, szczególnie po zastosowaniu techniki balansowania **SMOTE**.
+
+Przeprowadzono również **tuning hiperparametrów XGBoost** z użyciem losowego przeszukiwania przestrzeni 6 kluczowych parametrów. Choć metryki na zbiorze walidacyjnym nie poprawiły się istotnie względem modelu bazowego, tuning zapewnił **większą stabilność** wyników między zbiorem treningowym a walidacyjnym, zmniejszając ryzyko przeuczenia.
+
+Finalny model – przetrenowany na zbiorze `train + valid` i oceniony na niezależnym zbiorze testowym – osiągnął zbliżone wyniki metryk, co potwierdza jego zdolność do generalizacji i świadczy o dobrze przeprowadzonym procesie modelowania.
+
+**F1-score = 0.615** i **recall = 0.676** na zbiorze testowym pokazują, że model skutecznie wykrywa odejścia klientów, choć nadal **ok. 1/3 odejść pozostaje niewykryta**. Wynika to m.in. z:
+
+- natury problemu (odejście klienta to złożone zjawisko, które może być uzależnione od czynników niedostępnych w danych),
+
+- ograniczonej liczby cech – dane zawierają tylko podstawowe informacje demograficzno-finansowe, bez historii transakcji czy interakcji z bankiem.
+
+Mimo tych ograniczeń, stworzony model może pełnić rolę modułu wczesnego ostrzegania, wspierającego działania retencyjne banku – np. identyfikując klientów o podwyższonym ryzyku odejścia, zanim jeszcze faktycznie zrezygnują z usług.
